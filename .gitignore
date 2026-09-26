@@ -1,10 +1,15 @@
 # Large competition datasets (never commit dataset)
 dataset/
 output/
+student_resource/
+catboost_info/
+.cache/
 *.tsv
 *.csv
 *.zip
 *.tar.gz
+*.pt
+
 
 # Python cache & build files
 __pycache__/
