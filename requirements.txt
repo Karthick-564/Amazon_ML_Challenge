@@ -5,3 +5,7 @@ lightgbm>=4.0.0
 rapidfuzz>=3.0.0
 anyascii>=0.3.2
 joblib>=1.2.0
+torch>=2.2.0
+transformers>=4.40.0
+sentence-transformers>=3.0.0
+accelerate>=0.30.0

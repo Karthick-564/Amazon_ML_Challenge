@@ -11,6 +11,7 @@ from pathlib import Path
 
 import joblib
 import lightgbm as lgb
+import xgboost as xgb
 import numpy as np
 
 from .blocking import CountryIndex
@@ -24,7 +25,7 @@ from .normalize import NormalizedEntity, normalize_record
 def build_training_pipeline(
     data_root: Path,
     output_model_path: Path,
-    sample_s1_limit: int = 25000,
+    sample_s1_limit: int = 100000,
     val_ratio: float = 0.25,
 ) -> None:
     print(f"Starting training pipeline with seed {SEED}...")
@@ -89,7 +90,7 @@ def build_training_pipeline(
         for row in read_tsv(p, SOURCE_COLUMNS):
             eid = row["entity_id"]
             is_needed = eid in needed_for_file
-            if is_needed or distractor_count < 30000:
+            if is_needed or distractor_count < 250000:
                 target_rec = normalize_record(eid, row["business_name"], row["business_address"], row["country"])
                 idx = get_index(target_rec.country)
                 idx.add_target(target_rec)
@@ -97,7 +98,7 @@ def build_training_pipeline(
                     found_needed += 1
                 else:
                     distractor_count += 1
-            if found_needed >= len(needed_for_file) and distractor_count >= 30000:
+            if found_needed >= len(needed_for_file) and distractor_count >= 250000:
                 break
 
     for idx in country_indexes.values():
@@ -133,9 +134,9 @@ def build_training_pipeline(
     negatives = len(y_train_arr) - positives
     print(f"Generated {len(y_train_arr)} training candidate pairs (Positives: {positives}, Negatives: {negatives}).")
 
-    # 5. Train LightGBM model
+    # 5. Train LightGBM model and XGBoost model
     print("Training LightGBM pair matcher...")
-    model = lgb.LGBMClassifier(
+    model_lgb = lgb.LGBMClassifier(
         n_estimators=200,
         learning_rate=0.08,
         num_leaves=31,
@@ -144,7 +145,20 @@ def build_training_pipeline(
         n_jobs=-1,
         verbose=-1,
     )
-    model.fit(X_train_arr, y_train_arr)
+    model_lgb.fit(X_train_arr, y_train_arr)
+
+    print("Training XGBoost pair matcher...")
+    model_xgb = xgb.XGBClassifier(
+        n_estimators=200,
+        learning_rate=0.08,
+        max_depth=6,
+        random_state=SEED,
+        n_jobs=-1,
+        eval_metric='logloss',
+    )
+    model_xgb.fit(X_train_arr, y_train_arr)
+    
+    models = [model_lgb, model_xgb]
 
     # 6. Evaluate and tune threshold on validation set
     print(f"Evaluating on {len(val_s1)} held-out validation Source 1 entities...")
@@ -170,7 +184,9 @@ def build_training_pipeline(
             c_ids.append(tid)
 
         if pair_feats:
-            probs = model.predict_proba(np.array(pair_feats, dtype=np.float32))[:, 1]
+            X_val = np.array(pair_feats, dtype=np.float32)
+            preds = [mod.predict_proba(X_val)[:, 1] for mod in models]
+            probs = np.mean(preds, axis=0)
             val_cand_predictions[s1.entity_id] = list(zip(c_ids, probs))
         else:
             val_cand_predictions[s1.entity_id] = []
@@ -204,7 +220,7 @@ def build_training_pipeline(
     # 7. Save model and metadata
     output_model_path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
-        "model": model,
+        "models": models,
         "feature_names": FEATURE_NAMES,
         "threshold": best_thresh,
         "val_macro_f05": best_f05,
@@ -217,7 +233,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Train LightGBM matching model.")
     parser.add_argument("--data-root", type=Path, default=Path("../../dataset").resolve())
     parser.add_argument("--output-model", type=Path, default=Path("artifacts/matcher_model.joblib").resolve())
-    parser.add_argument("--sample-limit", type=int, default=25000)
+    parser.add_argument("--sample-limit", type=int, default=100000)
     args = parser.parse_args()
 
     build_training_pipeline(args.data_root, args.output_model, sample_s1_limit=args.sample_limit)

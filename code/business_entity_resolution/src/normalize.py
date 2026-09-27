@@ -180,6 +180,20 @@ def extract_postal_code(text: str, country: str) -> Optional[str]:
     return None
 
 
+def consonant_skeleton(text: str) -> str:
+    """Extract consonant skeleton by dropping vowels to normalize phonetic/accent variations."""
+    cleaned = re.sub(r"[^a-z0-9\s]", "", text.lower())
+    return re.sub(r"[aeiouy]", "", cleaned).strip()
+
+
+def extract_3grams(text: str) -> list[str]:
+    """Extract character 3-grams for robust fuzzy/phonetic indexing."""
+    s = re.sub(r"\s+", "", text.lower())
+    if len(s) < 3:
+        return [s] if s else []
+    return [s[i : i + 3] for i in range(len(s) - 2)]
+
+
 @dataclass(slots=True)
 class NormalizedEntity:
     entity_id: str
@@ -191,6 +205,8 @@ class NormalizedEntity:
     address_numbers: list[str]
     postal_code: Optional[str]
     is_non_latin: bool
+    skeleton: str
+    skeleton_3grams: list[str]
 
 
 def normalize_record(
@@ -203,6 +219,8 @@ def normalize_record(
     clean_address = normalize_text_base(business_address)
     address_numbers = extract_numbers(clean_address)
     postal_code = extract_postal_code(business_address, country)
+    skel = consonant_skeleton(root_name)
+    skel_3g = extract_3grams(skel)
 
     return NormalizedEntity(
         entity_id=entity_id,
@@ -214,4 +232,6 @@ def normalize_record(
         address_numbers=address_numbers,
         postal_code=postal_code,
         is_non_latin=is_non_latin,
+        skeleton=skel,
+        skeleton_3grams=skel_3g,
     )

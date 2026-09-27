@@ -1,6 +1,7 @@
 # Large competition datasets (never commit dataset)
 dataset/
 output/
+output*/
 *.tsv
 *.csv
 *.zip

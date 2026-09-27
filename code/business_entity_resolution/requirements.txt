@@ -1,9 +1,13 @@
 anyascii==0.3.3
 joblib==1.5.3
 lightgbm==4.7.0
-numpy==2.2.6
-pandas==2.3.3
+numpy>=1.26.0
+pandas>=2.2.0
 rapidfuzz==3.14.5
 scikit-learn==1.7.2
 scipy==1.15.3
 tqdm==4.68.3
+torch>=2.2.0
+transformers>=4.40.0
+sentence-transformers>=3.0.0
+accelerate>=0.30.0

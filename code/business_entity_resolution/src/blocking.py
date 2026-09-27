@@ -34,16 +34,18 @@ def extract_prefix_keys(root_name: str) -> list[str]:
 
 
 class CountryIndex:
-    """High-recall multi-route candidate retrieval index for a single country partition."""
+    """High-recall dual-view candidate retrieval index with phonetic skeleton & multi-tenant detection."""
 
     def __init__(self, country: str):
         self.country = country
         self.name_index: dict[str, list[str]] = defaultdict(list)
         self.prefix_index: dict[str, list[str]] = defaultdict(list)
         self.token_index: dict[str, list[str]] = defaultdict(list)
+        self.skeleton_3gram_index: dict[str, list[str]] = defaultdict(list)
         self.postal_prefix_index: dict[tuple[str, str], list[str]] = defaultdict(list)
         self.addr_num_token_index: dict[tuple[str, str], list[str]] = defaultdict(list)
         self.token_doc_counts: Counter[str] = Counter()
+        self.address_doc_counts: Counter[str] = Counter()
         self.entity_store: dict[str, NormalizedEntity] = {}
 
     def add_target(self, target: NormalizedEntity) -> None:
@@ -51,14 +53,23 @@ class CountryIndex:
         eid = target.entity_id
         self.entity_store[eid] = target
 
-        # Route 1: Exact root name
+        # Track address density (flags multi-tenant / domiciliation commercial centers)
+        if target.clean_address:
+            self.address_doc_counts[target.clean_address] += 1
+
+        # View 1: Exact root name
         if len(target.root_name) >= 3:
             self.name_index[target.root_name].append(eid)
 
-        # Route 2: Prefix bigram keys
+        # View 1b: Prefix bigram keys
         for pkey in extract_prefix_keys(target.root_name):
             if len(self.prefix_index[pkey]) < 80:
                 self.prefix_index[pkey].append(eid)
+
+        # View 2: Consonant skeleton 3-grams (bridges Indic transliteration and French accent drift)
+        for trigram in target.skeleton_3grams:
+            if len(self.skeleton_3gram_index[trigram]) < 100:
+                self.skeleton_3gram_index[trigram].append(eid)
 
         # Count token frequencies for rare token detection
         tokens = set(target.root_name.split())
@@ -66,21 +77,21 @@ class CountryIndex:
             if len(tok) >= 3:
                 self.token_doc_counts[tok] += 1
 
-        # Route 3: Postal code + first token prefix
+        # View 1c: Postal code + first token prefix
         if target.postal_code and tokens:
             first_tok = target.root_name.split()[0][:4]
             if len(first_tok) >= 3:
                 self.postal_prefix_index[(target.postal_code, first_tok)].append(eid)
 
-        # Route 4: Address number + token indexing
+        # View 1d: Address number + token indexing
         addr_words = [w for w in target.clean_address.split() if len(w) >= 4]
         for num in target.address_numbers[:2]:
             for w in addr_words[:3]:
-                if len(self.addr_num_token_index[(num, w)]) < 40:
+                if len(self.addr_num_token_index[(num, w)]) < 50:
                     self.addr_num_token_index[(num, w)].append(eid)
 
     def finalize_tokens(self, max_token_freq: int = 1500) -> None:
-        """Build the inverted index for distinctive tokens (higher threshold to capture common words)."""
+        """Build the inverted index for distinctive tokens."""
         for eid, target in self.entity_store.items():
             tokens = set(target.root_name.split())
             for tok in tokens:
@@ -88,23 +99,32 @@ class CountryIndex:
                     if len(self.token_index[tok]) < 50:
                         self.token_index[tok].append(eid)
 
+    def is_high_density_hub(self, address: str) -> bool:
+        """Returns True if the address hosts >= 20 entities (commercial plaza / domiciliation hub)."""
+        return self.address_doc_counts.get(address, 0) >= 20
+
     def retrieve_candidates(
-        self, s1: NormalizedEntity, max_candidates: int = MAX_CANDIDATES_PER_S1
+        self, s1: NormalizedEntity, max_candidates: int = 50
     ) -> list[tuple[str, float]]:
-        """Retrieve top candidate IDs and heuristic retrieval scores for an S1 entity."""
+        """Retrieve top candidate IDs using dual views (word tokens + consonant skeleton 3-grams)."""
         candidate_scores: dict[str, float] = defaultdict(float)
 
-        # Route 1: Exact root name match (weight 5.0)
+        # 1. Exact root name match (weight 5.0)
         if len(s1.root_name) >= 3:
             for tid in self.name_index.get(s1.root_name, ()):
                 candidate_scores[tid] += 5.0
 
-        # Route 2: Prefix bigram matches (weight 3.5)
+        # 2. Prefix bigram matches (weight 3.5)
         for pkey in extract_prefix_keys(s1.root_name):
             for tid in self.prefix_index.get(pkey, ())[:40]:
                 candidate_scores[tid] += 3.5
 
-        # Route 3: Distinctive token match in root name (weight 2.0)
+        # 3. Consonant skeleton 3-gram match (weight 2.5 — recovers transliterations)
+        for trigram in s1.skeleton_3grams:
+            for tid in self.skeleton_3gram_index.get(trigram, ())[:30]:
+                candidate_scores[tid] += 2.5
+
+        # 4. Distinctive token match in root name (weight 2.0)
         tokens = set(s1.root_name.split())
         for tok in tokens:
             if len(tok) >= 3:
@@ -114,14 +134,14 @@ class CountryIndex:
                     for tid in self.token_index.get(tok, ())[:35]:
                         candidate_scores[tid] += weight
 
-        # Route 4: Postal code + first token prefix (weight 4.0)
+        # 5. Postal code + first token prefix (weight 4.0)
         if s1.postal_code and tokens:
             first_tok = s1.root_name.split()[0][:4]
             if len(first_tok) >= 3:
                 for tid in self.postal_prefix_index.get((s1.postal_code, first_tok), ())[:30]:
                     candidate_scores[tid] += 4.0
 
-        # Route 5: Address number + street/locality word (weight 2.5)
+        # 6. Address number + street word (weight 2.5)
         addr_words = [w for w in s1.clean_address.split() if len(w) >= 4]
         for num in s1.address_numbers[:2]:
             for w in addr_words[:3]:
@@ -131,6 +151,6 @@ class CountryIndex:
         if not candidate_scores:
             return []
 
-        # Sort descending by score, retain top candidates with score >= 1.5
+        # Sort descending by score, retain top candidates up to max_candidates (50)
         ranked = sorted(candidate_scores.items(), key=lambda x: -x[1])[:max_candidates]
         return [(tid, score) for tid, score in ranked if score >= 1.5]

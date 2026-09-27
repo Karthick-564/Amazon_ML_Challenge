@@ -7,6 +7,7 @@ import csv
 import time
 from collections import defaultdict
 from pathlib import Path
+import concurrent.futures
 
 import joblib
 import lightgbm as lgb
@@ -29,7 +30,7 @@ def run_inference(
 ) -> None:
     t0 = time.time()
     print("=" * 60)
-    print("STARTING OPTIMIZED BATCHED TEST INFERENCE PIPELINE")
+    print("STARTING THREADED OPTIMIZED BATCHED TEST INFERENCE PIPELINE")
     print(f"Data root:   {data_root}")
     print(f"Model path:  {model_path}")
     print(f"Output dir:  {output_dir}")
@@ -40,9 +41,12 @@ def run_inference(
     if not model_path.is_file():
         raise FileNotFoundError(f"Model file not found at {model_path}. Run training first.")
     payload = joblib.load(model_path)
-    model: lgb.LGBMClassifier = payload["model"]
+    if "models" in payload:
+        models = payload["models"]
+    else:
+        models = [payload["model"]]
     decision_threshold = threshold_override if threshold_override is not None else payload.get("threshold", OPTIMAL_THRESHOLD)
-    print(f"Loaded matcher model. Using decision threshold: {decision_threshold:.2f}")
+    print(f"Loaded {len(models)} matcher model(s). Using decision threshold: {decision_threshold:.2f}")
 
     # 2. Build target indexes from test_source2 and test_source3
     print("\nStreaming test_source2 and test_source3 to build country indexes...")
@@ -57,7 +61,8 @@ def run_inference(
     for src_filename in ("test_source2.tsv", "test_source3.tsv"):
         p = data_root / "test" / src_filename
         if not p.is_file():
-            raise FileNotFoundError(f"Test file not found: {p}")
+            print(f"Warning: Test file not found: {p}")
+            continue
         print(f"  Indexing {src_filename}...")
         t_src = time.time()
         count = 0
@@ -87,10 +92,97 @@ def run_inference(
     candidate_tsv_path = output_dir / "candidate_pairs.tsv"
     matching_tsv_path = output_dir / "matching_results.tsv"
 
-    print(f"\nProcessing {test_s1_path} in batches of {batch_size}...")
+    print(f"\nProcessing {test_s1_path} in batches of {batch_size} using ThreadPoolExecutor...")
     s1_processed = 0
     total_candidates_emitted = 0
     total_matches_emitted = 0
+
+    def process_batch(batch: list[NormalizedEntity]) -> list[dict]:
+        batch_pairs_feats = []
+        pair_meta = []
+        batch_cand_ids = {}
+
+        for s1_rec in batch:
+            idx = country_indexes.get(s1_rec.country)
+            if not idx:
+                batch_cand_ids[s1_rec.entity_id] = []
+                continue
+
+            cands = idx.retrieve_candidates(s1_rec, max_candidates=MAX_CANDIDATES_PER_S1)
+            if not cands:
+                batch_cand_ids[s1_rec.entity_id] = []
+                continue
+
+            cand_ids = sorted({tid for tid, _ in cands})
+            batch_cand_ids[s1_rec.entity_id] = cand_ids
+
+            for tid, r_sc in cands:
+                cand_rec = idx.entity_store.get(tid)
+                if not cand_rec:
+                    continue
+                feats = extract_pair_features(s1_rec, cand_rec, r_sc)
+                batch_pairs_feats.append(feats)
+                pair_meta.append((s1_rec.entity_id, tid))
+
+        s1_cands_scored: dict[str, list[tuple[str, float]]] = defaultdict(list)
+        if batch_pairs_feats:
+            X_batch = np.array(batch_pairs_feats, dtype=np.float32)
+            preds = [mod.predict_proba(X_batch)[:, 1] for mod in models]
+            probs = np.mean(preds, axis=0)
+
+            for (s1_id, tid), prob in zip(pair_meta, probs):
+                s1_cands_scored[s1_id].append((tid, float(prob)))
+
+        batch_matches: dict[str, set[str]] = defaultdict(set)
+        for s1_rec in batch:
+            sid = s1_rec.entity_id
+            cands_p = s1_cands_scored.get(sid, [])
+            if not cands_p:
+                continue
+
+            cands_p.sort(key=lambda x: -x[1])
+            top_tid, top_prob = cands_p[0]
+
+            seg_th = SEGMENT_THRESHOLDS.get(s1_rec.country, decision_threshold)
+
+            if top_prob < (seg_th - 0.10):
+                continue
+
+            for tid, prob in cands_p:
+                if prob >= seg_th and prob >= (0.75 * top_prob):
+                    batch_matches[sid].add(tid)
+                elif prob >= 0.85:
+                    batch_matches[sid].add(tid)
+
+        results = []
+        for s1_rec in batch:
+            sid = s1_rec.entity_id
+            c_list = batch_cand_ids.get(sid, [])
+            m_list = sorted(batch_matches.get(sid, set()))
+            results.append({
+                "sid": sid,
+                "c_str": ",".join(c_list),
+                "m_str": ",".join(m_list),
+                "n_cands": len(c_list),
+                "n_matches": len(m_list)
+            })
+        return results
+
+    def batch_generator():
+        s1_batch = []
+        count = 0
+        for row in read_tsv(test_s1_path, SOURCE_COLUMNS):
+            s1_batch.append(
+                normalize_record(row["entity_id"], row["business_name"], row["business_address"], row["country"])
+            )
+            count += 1
+            if len(s1_batch) >= batch_size:
+                yield s1_batch
+                s1_batch = []
+            if sample_limit and count >= sample_limit:
+                break
+        if s1_batch:
+            yield s1_batch
 
     with candidate_tsv_path.open("w", encoding="utf-8", newline="") as f_cand, \
          matching_tsv_path.open("w", encoding="utf-8", newline="") as f_match:
@@ -98,108 +190,34 @@ def run_inference(
         cand_writer = csv.writer(f_cand, delimiter="\t", lineterminator="\n")
         match_writer = csv.writer(f_match, delimiter="\t", lineterminator="\n")
 
-        # Headers
         cand_writer.writerow(CANDIDATE_COLUMNS)
         match_writer.writerow(MATCHING_COLUMNS)
 
-        # Batch accumulator
-        s1_batch: list[NormalizedEntity] = []
+        batches = list(batch_generator())
+        total_batches = len(batches)
+        print(f"  Total batches to process: {total_batches} ({total_batches * batch_size:,} max records)")
 
-        def process_batch(batch: list[NormalizedEntity]) -> None:
-            nonlocal total_candidates_emitted, total_matches_emitted
+        with concurrent.futures.ThreadPoolExecutor(max_workers=16) as executor:
+            futures = {executor.submit(process_batch, b): i for i, b in enumerate(batches)}
+            done_count = 0
+            # Collect in submission order for TSV ordering
+            ordered_results = [None] * total_batches
+            for fut in concurrent.futures.as_completed(futures):
+                idx = futures[fut]
+                ordered_results[idx] = fut.result()
+                done_count += 1
+                elapsed = max(0.1, time.time() - t0)
+                pct = 100.0 * done_count / total_batches
+                print(f"  [{done_count}/{total_batches}] {pct:.1f}% batches done | {elapsed:.0f}s elapsed", flush=True)
 
-            batch_pairs_feats: list[list[float]] = []
-            # Map from pair index to (s1_id, candidate_target_id)
-            pair_meta: list[tuple[str, str]] = []
-            # Keep candidate IDs per S1
-            batch_cand_ids: dict[str, list[str]] = {}
-
-            for s1_rec in batch:
-                idx = country_indexes.get(s1_rec.country)
-                if not idx:
-                    batch_cand_ids[s1_rec.entity_id] = []
-                    continue
-
-                cands = idx.retrieve_candidates(s1_rec, max_candidates=MAX_CANDIDATES_PER_S1)
-                if not cands:
-                    batch_cand_ids[s1_rec.entity_id] = []
-                    continue
-
-                # Deduplicate and sort candidate IDs
-                cand_ids = sorted({tid for tid, _ in cands})
-                batch_cand_ids[s1_rec.entity_id] = cand_ids
-
-                for tid, r_sc in cands:
-                    cand_rec = idx.entity_store.get(tid)
-                    if not cand_rec:
-                        continue
-                    feats = extract_pair_features(s1_rec, cand_rec, r_sc)
-                    batch_pairs_feats.append(feats)
-                    pair_meta.append((s1_rec.entity_id, tid))
-
-            # Batched model inference & adaptive rank+prefix selection
-            s1_cands_scored: dict[str, list[tuple[str, float]]] = defaultdict(list)
-            if batch_pairs_feats:
-                X_batch = np.array(batch_pairs_feats, dtype=np.float32)
-                probs = model.predict_proba(X_batch)[:, 1]
-                for (s1_id, tid), prob in zip(pair_meta, probs):
-                    s1_cands_scored[s1_id].append((tid, float(prob)))
-
-            batch_matches: dict[str, set[str]] = defaultdict(set)
-            for s1_rec in batch:
-                sid = s1_rec.entity_id
-                cands_p = s1_cands_scored.get(sid, [])
-                if not cands_p:
-                    continue
-
-                # Sort descending by model probability
-                cands_p.sort(key=lambda x: -x[1])
-                top_tid, top_prob = cands_p[0]
-
-                seg_th = SEGMENT_THRESHOLDS.get(s1_rec.country, decision_threshold)
-
-                # Singleton gate: if even top candidate is weak, emit empty (singleton)
-                if top_prob < (seg_th - 0.10):
-                    continue
-
-                for tid, prob in cands_p:
-                    # Keep if above segment threshold AND within 75% of top candidate's confidence
-                    if prob >= seg_th and prob >= (0.75 * top_prob):
-                        batch_matches[sid].add(tid)
-                    elif prob >= 0.85:
-                        batch_matches[sid].add(tid)
-
-            # Write results in exact S1 order
-            for s1_rec in batch:
-                sid = s1_rec.entity_id
-                c_list = batch_cand_ids.get(sid, [])
-                m_list = sorted(batch_matches.get(sid, set()))
-
-                cand_writer.writerow((sid, ",".join(c_list)))
-                match_writer.writerow((sid, ",".join(m_list)))
-
-                total_candidates_emitted += len(c_list)
-                total_matches_emitted += len(m_list)
-
-        for row in read_tsv(test_s1_path, SOURCE_COLUMNS):
-            s1_processed += 1
-            s1_batch.append(
-                normalize_record(row["entity_id"], row["business_name"], row["business_address"], row["country"])
-            )
-
-            if len(s1_batch) >= batch_size:
-                process_batch(s1_batch)
-                s1_batch = []
-                if s1_processed % 50000 == 0:
-                    elapsed = time.time() - t0
-                    print(f"  Processed {s1_processed:,} Source-1 entities ({elapsed:.1f}s, {s1_processed/elapsed:.0f} S1/s)...")
-
-            if sample_limit and s1_processed >= sample_limit:
-                break
-
-        # Process any remaining records
-        if s1_batch:
-            process_batch(s1_batch)
+        print("Writing results to TSV...", flush=True)
+        for results in ordered_results:
+            for res in results:
+                cand_writer.writerow((res["sid"], res["c_str"]))
+                match_writer.writerow((res["sid"], res["m_str"]))
+                total_candidates_emitted += res["n_cands"]
+                total_matches_emitted += res["n_matches"]
+                s1_processed += 1
 
     dt = time.time() - t0
     print("\n" + "=" * 60)
