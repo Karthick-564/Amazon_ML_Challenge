@@ -11,13 +11,20 @@ TRUTH_COLUMNS = ("source1_entity_id", "matched_entity_ids")
 MATCHING_COLUMNS = TRUTH_COLUMNS
 CANDIDATE_COLUMNS = ("source1_entity_id", "candidate_entity_ids")
 
-# Optimal decision thresholds tuned for macro F_0.5 on held-out validation
-OPTIMAL_THRESHOLD = 0.70
+# Optimal decision thresholds tuned for macro F_0.5 on representative held-out validation
+OPTIMAL_THRESHOLD = 0.45
 SEGMENT_THRESHOLDS = {
-    "US": 0.70,
-    "India": 0.65,
-    "France": 0.70,
+    "US": 0.45,
+    "India": 0.45,
+    "France": 0.45,
 }
+
+
+def get_segment_threshold(country: str) -> float:
+    """Return calibrated threshold for country, falling back gracefully for unseen countries."""
+    from .normalize import normalize_country
+    c = normalize_country(country)
+    return SEGMENT_THRESHOLDS.get(c, OPTIMAL_THRESHOLD)
 
 # Maximum candidates per S1 entity emitted to candidate_pairs.tsv
 MAX_CANDIDATES_PER_S1 = 20

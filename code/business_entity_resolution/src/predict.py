@@ -12,8 +12,17 @@ import joblib
 import lightgbm as lgb
 import numpy as np
 
-from .blocking import CountryIndex
-from .config import CANDIDATE_COLUMNS, MATCHING_COLUMNS, MAX_CANDIDATES_PER_S1, OPTIMAL_THRESHOLD, SEGMENT_THRESHOLDS, SOURCE_COLUMNS
+from .blocking import CountryIndex, CandidateResult
+from .config import (
+    CANDIDATE_COLUMNS,
+    MATCHING_COLUMNS,
+    MAX_CANDIDATES_PER_S1,
+    OPTIMAL_THRESHOLD,
+    SEGMENT_THRESHOLDS,
+    SOURCE_COLUMNS,
+    get_segment_threshold,
+)
+from .decision_policy import adaptive_cap, evidence_aware_match
 from .features import extract_pair_features
 from .io_utils import read_tsv
 from .normalize import NormalizedEntity, normalize_record
@@ -68,9 +77,13 @@ def run_inference(
             idx = get_index(target_rec.country)
             idx.add_target(target_rec)
             count += 1
+            if count % 500_000 == 0:
+                elapsed = time.time() - t_src
+                rate = count / max(elapsed, 0.001)
+                print(f"    ... {count:,} records indexed ({elapsed:.0f}s elapsed, {rate:,.0f} rec/s)")
             if sample_limit and count >= sample_limit:
                 break
-        print(f"    Indexed {count} records from {src_filename} in {time.time()-t_src:.1f}s.")
+        print(f"  --> Completed {src_filename}: {count:,} records in {time.time()-t_src:.1f}s.")
 
     print("Finalizing inverted token indices...")
     for idx in country_indexes.values():
@@ -117,57 +130,68 @@ def run_inference(
             for s1_rec in batch:
                 idx = country_indexes.get(s1_rec.country)
                 if not idx:
+                    c_lower = s1_rec.country.lower()
+                    for k, v in country_indexes.items():
+                        if k.lower() == c_lower:
+                            idx = v
+                            break
+                if not idx and len(country_indexes) == 1:
+                    idx = next(iter(country_indexes.values()))
+                if not idx:
                     batch_cand_ids[s1_rec.entity_id] = []
                     continue
 
-                cands = idx.retrieve_candidates(s1_rec, max_candidates=MAX_CANDIDATES_PER_S1)
+                # Gap 9: adaptive per-S1 candidate budget
+                cap = adaptive_cap(s1_rec)
+                cands = idx.retrieve_candidates_full(s1_rec, max_candidates=cap)
                 if not cands:
                     batch_cand_ids[s1_rec.entity_id] = []
                     continue
 
-                # Deduplicate and sort candidate IDs
-                cand_ids = sorted({tid for tid, _ in cands})
+                # Sorted unique candidate IDs for candidate_pairs.tsv
+                cand_ids = sorted({cr.entity_id for cr in cands})
                 batch_cand_ids[s1_rec.entity_id] = cand_ids
 
-                for tid, r_sc in cands:
-                    cand_rec = idx.entity_store.get(tid)
+                # Context values shared across all candidates of this S1
+                n_cands = len(cands)
+                max_rs  = cands[0].retrieval_score  # list is sorted descending
+
+                for rank, cr in enumerate(cands, 1):
+                    cand_rec = idx.entity_store.get(cr.entity_id)
                     if not cand_rec:
                         continue
-                    feats = extract_pair_features(s1_rec, cand_rec, r_sc)
+                    rs_norm   = cr.retrieval_score / max_rs
+                    rs_margin = max_rs - cr.retrieval_score  # 0 for rank-1
+                    feats = extract_pair_features(
+                        s1_rec, cand_rec, cr.retrieval_score,
+                        n_candidates=n_cands,
+                        retrieval_rank=rank,
+                        retrieval_score_norm=rs_norm,
+                        retrieval_margin=rs_margin,
+                        n_routes=cr.n_routes,
+                    )
                     batch_pairs_feats.append(feats)
-                    pair_meta.append((s1_rec.entity_id, tid))
+                    pair_meta.append((s1_rec.entity_id, cr.entity_id))
 
-            # Batched model inference & adaptive rank+prefix selection
-            s1_cands_scored: dict[str, list[tuple[str, float]]] = defaultdict(list)
+            # Batched model inference -> probability scores
+            # Store (tid, prob, feats) triples so decision policy can access
+            # evidence without re-computation (Gap 10).
+            s1_cands_full_scored: dict = defaultdict(list)
             if batch_pairs_feats:
                 X_batch = np.array(batch_pairs_feats, dtype=np.float32)
                 probs = model.predict_proba(X_batch)[:, 1]
-                for (s1_id, tid), prob in zip(pair_meta, probs):
-                    s1_cands_scored[s1_id].append((tid, float(prob)))
+                for (s1_id, tid), prob, feats in zip(pair_meta, probs, batch_pairs_feats):
+                    s1_cands_full_scored[s1_id].append((tid, float(prob), feats))
 
-            batch_matches: dict[str, set[str]] = defaultdict(set)
+            # Gap 10: evidence-aware decision policy
+            batch_matches: dict = defaultdict(set)
             for s1_rec in batch:
                 sid = s1_rec.entity_id
-                cands_p = s1_cands_scored.get(sid, [])
-                if not cands_p:
+                scored = s1_cands_full_scored.get(sid, [])
+                if not scored:
                     continue
-
-                # Sort descending by model probability
-                cands_p.sort(key=lambda x: -x[1])
-                top_tid, top_prob = cands_p[0]
-
-                seg_th = SEGMENT_THRESHOLDS.get(s1_rec.country, decision_threshold)
-
-                # Singleton gate: if even top candidate is weak, emit empty (singleton)
-                if top_prob < (seg_th - 0.10):
-                    continue
-
-                for tid, prob in cands_p:
-                    # Keep if above segment threshold AND within 75% of top candidate's confidence
-                    if prob >= seg_th and prob >= (0.75 * top_prob):
-                        batch_matches[sid].add(tid)
-                    elif prob >= 0.85:
-                        batch_matches[sid].add(tid)
+                seg_th = threshold_override if threshold_override is not None else get_segment_threshold(s1_rec.country)
+                batch_matches[sid] = evidence_aware_match(s1_rec, scored, seg_th)
 
             # Write results in exact S1 order
             for s1_rec in batch:
@@ -181,6 +205,7 @@ def run_inference(
                 total_candidates_emitted += len(c_list)
                 total_matches_emitted += len(m_list)
 
+        t_inf_start = time.time()
         for row in read_tsv(test_s1_path, SOURCE_COLUMNS):
             s1_processed += 1
             s1_batch.append(
@@ -190,9 +215,17 @@ def run_inference(
             if len(s1_batch) >= batch_size:
                 process_batch(s1_batch)
                 s1_batch = []
-                if s1_processed % 50000 == 0:
-                    elapsed = time.time() - t0
-                    print(f"  Processed {s1_processed:,} Source-1 entities ({elapsed:.1f}s, {s1_processed/elapsed:.0f} S1/s)...")
+                if s1_processed % 10_000 == 0:
+                    elapsed = time.time() - t_inf_start
+                    rate = s1_processed / max(elapsed, 0.001)
+                    avg_c = total_candidates_emitted / max(s1_processed, 1)
+                    avg_m = total_matches_emitted / max(s1_processed, 1)
+                    if sample_limit:
+                        pct = (s1_processed / sample_limit) * 100
+                        eta_s = (sample_limit - s1_processed) / max(rate, 0.001)
+                        print(f"  [{s1_processed:,}/{sample_limit:,}] ({pct:.1f}%) | {rate:.0f} S1/s | ETA: {eta_s/60:.1f}m | avg cands: {avg_c:.1f} | matches: {total_matches_emitted:,} ({avg_m:.2f}/S1)")
+                    else:
+                        print(f"  [{s1_processed:,}] | {rate:.0f} S1/s | elapsed: {elapsed/60:.1f}m | avg cands: {avg_c:.1f} | matches: {total_matches_emitted:,} ({avg_m:.2f}/S1)")
 
             if sample_limit and s1_processed >= sample_limit:
                 break

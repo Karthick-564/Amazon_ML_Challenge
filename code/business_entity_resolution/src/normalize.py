@@ -17,6 +17,8 @@ from typing import Optional
 
 import anyascii
 
+from .address_parser import ParsedAddress, parse_address
+
 
 # Common Indian state names in native scripts mapped to standard Latin names
 STATE_SCRIPT_MAP = {
@@ -93,11 +95,129 @@ LEGAL_SUFFIX_PATTERNS = [
     for suffix, cat in sorted(LEGAL_SUFFIX_MAP.items(), key=lambda x: -len(x[0]))
 ]
 
-# Numeric patterns
-PIN_CODE_RE = re.compile(r"\b[1-9][0-9]{5}\b")  # 6-digit Indian PIN
-US_ZIP_RE = re.compile(r"\b[0-9]{5}(?:-[0-9]{4})?\b")  # 5-digit US ZIP
-FR_ZIP_RE = re.compile(r"\b[0-9]{5}\b")  # 5-digit French postal code
+# Canonical country name aliases mapping to standard representation
+COUNTRY_ALIASES = {
+    "us": "US",
+    "usa": "US",
+    "u s": "US",
+    "u s a": "US",
+    "united states": "US",
+    "united states of america": "US",
+    "in": "India",
+    "ind": "India",
+    "india": "India",
+    "bharat": "India",
+    "fr": "France",
+    "fra": "France",
+    "france": "France",
+    "uk": "UK",
+    "gbr": "UK",
+    "gb": "UK",
+    "united kingdom": "UK",
+    "great britain": "UK",
+    "england": "UK",
+    "de": "Germany",
+    "deu": "Germany",
+    "germany": "Germany",
+    "deutschland": "Germany",
+    "ca": "Canada",
+    "can": "Canada",
+    "canada": "Canada",
+    "au": "Australia",
+    "aus": "Australia",
+    "australia": "Australia",
+    "jp": "Japan",
+    "jpn": "Japan",
+    "japan": "Japan",
+    "cn": "China",
+    "chn": "China",
+    "china": "China",
+    "br": "Brazil",
+    "bra": "Brazil",
+    "brazil": "Brazil",
+    "mx": "Mexico",
+    "mex": "Mexico",
+    "mexico": "Mexico",
+    "es": "Spain",
+    "esp": "Spain",
+    "spain": "Spain",
+    "it": "Italy",
+    "ita": "Italy",
+    "italy": "Italy",
+    "sg": "Singapore",
+    "singapore": "Singapore",
+    "nl": "Netherlands",
+    "nld": "Netherlands",
+    "netherlands": "Netherlands",
+}
+
+# Regex to detect country name mentioned near the tail of an address if country is missing
+COUNTRY_TAIL_RE = re.compile(
+    r"\b(united states|usa|u\.s\.a\.|u\.s\.|india|bharat|france|united kingdom|uk|great britain|germany|deutschland|canada|australia|japan|china|brazil|spain|italy|singapore|netherlands)\s*$",
+    re.IGNORECASE,
+)
+
+# Known country-specific postal code regexes
+COUNTRY_POSTAL_REGEX = {
+    "India": re.compile(r"\b[1-9][0-9]{5}\b"),                                # 6-digit PIN
+    "US": re.compile(r"\b[0-9]{5}(?:-[0-9]{4})?\b"),                          # 5-digit ZIP or ZIP+4
+    "France": re.compile(r"\b[0-9]{5}\b"),                                    # 5-digit code
+    "Germany": re.compile(r"\b[0-9]{5}\b"),                                   # 5-digit code
+    "Spain": re.compile(r"\b[0-9]{5}\b"),                                     # 5-digit code
+    "Italy": re.compile(r"\b[0-9]{5}\b"),                                     # 5-digit code
+    "UK": re.compile(r"\b[A-Z]{1,2}[0-9][A-Z0-9]?\s*[0-9][A-Z]{2}\b", re.I),  # UK alphanumeric
+    "Canada": re.compile(r"\b[A-Z][0-9][A-Z]\s*[0-9][A-Z][0-9]\b", re.I),    # Canadian alphanumeric
+    "Australia": re.compile(r"\b[0-9]{4}\b"),                                 # 4-digit code
+    "Japan": re.compile(r"\b[0-9]{3}-?[0-9]{4}\b"),                           # 7-digit code
+    "Brazil": re.compile(r"\b[0-9]{5}-?[0-9]{3}\b"),                          # 8-digit code
+    "Singapore": re.compile(r"\b[0-9]{6}\b"),                                 # 6-digit code
+    "Netherlands": re.compile(r"\b[1-9][0-9]{3}\s?[A-Z]{2}\b", re.I),         # 4-digit + 2 letters
+}
+
+# Generic open-set fallback postal regexes (applied in priority order if country is unknown/unseen)
+GENERIC_POSTAL_PATTERNS = [
+    re.compile(r"\b[A-Z]{1,2}[0-9][A-Z0-9]?\s*[0-9][A-Z]{2}\b", re.I),       # Alphanumeric UK/Commonwealth
+    re.compile(r"\b[A-Z][0-9][A-Z]\s*[0-9][A-Z][0-9]\b", re.I),               # Alphanumeric Canadian
+    re.compile(r"\b[1-9][0-9]{4,5}\b"),                                       # 5 to 6 digits (global standard in ~80% of nations)
+    re.compile(r"\b\d{4}\b"),                                                 # 4-digit near end of address
+]
+
 NUMBERS_RE = re.compile(r"\b\d+\b")  # standalone numbers
+
+
+def normalize_country(raw_country: str, address_fallback: str = "") -> str:
+    """Normalize a raw country string into a canonical partition key.
+
+    Handles:
+    - Known aliases, ISO codes, and full country names.
+    - Case variations, punctuation, and leading/trailing whitespace.
+    - Fallback country extraction from address if raw_country is missing/empty.
+    - Open-set unseen countries: canonicalizes to title-case/upper-case so unseen
+      countries partition consistently across sources without hardcoding.
+    """
+    if raw_country:
+        c_strip = raw_country.strip()
+        c_low = c_strip.lower()
+        if c_low in COUNTRY_ALIASES:
+            return COUNTRY_ALIASES[c_low]
+        cleaned = re.sub(r"[^\w\s]", " ", c_strip).strip().lower()
+        cleaned = re.sub(r"\s+", " ", cleaned)
+        if cleaned in COUNTRY_ALIASES:
+            return COUNTRY_ALIASES[cleaned]
+        # Open-set unseen country: format nicely as Title Case or uppercase code
+        if len(cleaned) <= 3:
+            return cleaned.upper()
+        return cleaned.title()
+
+    # Fallback: check if address ends with a known country name
+    if address_fallback:
+        m = COUNTRY_TAIL_RE.search(address_fallback.strip())
+        if m:
+            detected = m.group(1).lower().replace(".", "")
+            if detected in COUNTRY_ALIASES:
+                return COUNTRY_ALIASES[detected]
+
+    return "UNKNOWN"
 
 
 def strip_accents(text: str) -> str:
@@ -163,20 +283,34 @@ def extract_numbers(text: str) -> list[str]:
     return NUMBERS_RE.findall(text)
 
 
-def extract_postal_code(text: str, country: str) -> Optional[str]:
-    """Extract country-appropriate postal code from address if present."""
+def extract_postal_code(text: str, country: str = "") -> Optional[str]:
+    """Extract country-appropriate postal code from address, with generic open-set fallback.
+
+    If the country has a known postal standard, applies that pattern first.
+    If the country is unknown or unseen, sequentially evaluates standard international
+    postal patterns (alphanumeric, 5-6 digit, 4-digit) to capture postal anchors globally.
+    """
     if not text:
         return None
-    c_lower = country.lower()
-    if "india" in c_lower:
-        match = PIN_CODE_RE.search(text)
-        return match.group(0) if match else None
-    elif "us" in c_lower:
-        match = US_ZIP_RE.search(text)
-        return match.group(0)[:5] if match else None
-    elif "france" in c_lower:
-        match = FR_ZIP_RE.search(text)
-        return match.group(0) if match else None
+
+    # 1. Known country-specific pattern
+    canon_country = normalize_country(country) if country else ""
+    if canon_country in COUNTRY_POSTAL_REGEX:
+        pat = COUNTRY_POSTAL_REGEX[canon_country]
+        match = pat.search(text)
+        if match:
+            raw = match.group(0).strip()
+            # For US ZIP+4, use first 5 digits
+            if canon_country == "US" and len(raw) > 5 and "-" in raw:
+                return raw[:5]
+            return raw
+
+    # 2. Generic open-set fallback: evaluate international patterns
+    for pat in GENERIC_POSTAL_PATTERNS:
+        match = pat.search(text)
+        if match:
+            return match.group(0).strip()
+
     return None
 
 
@@ -188,9 +322,14 @@ class NormalizedEntity:
     root_name: str
     legal_suffix: str
     clean_address: str
-    address_numbers: list[str]
+    address_numbers: list
     postal_code: Optional[str]
     is_non_latin: bool
+    # Parsed address fields (Gap 7)
+    addr_house: str             # house / building number string
+    addr_street: list           # tokens for street / road portion
+    addr_locality: list         # tokens for area / colony / locality
+    addr_city: str              # city proxy token (last substantive word)
 
 
 def normalize_record(
@@ -202,11 +341,13 @@ def normalize_record(
     root_name, legal_suffix = extract_legal_suffix(clean_name)
     clean_address = normalize_text_base(business_address)
     address_numbers = extract_numbers(clean_address)
-    postal_code = extract_postal_code(business_address, country)
+    canon_country = normalize_country(country, business_address)
+    postal_code = extract_postal_code(business_address, canon_country)
+    parsed = parse_address(clean_address)
 
     return NormalizedEntity(
         entity_id=entity_id,
-        country=country.strip(),
+        country=canon_country,
         clean_name=clean_name,
         root_name=root_name,
         legal_suffix=legal_suffix,
@@ -214,4 +355,8 @@ def normalize_record(
         address_numbers=address_numbers,
         postal_code=postal_code,
         is_non_latin=is_non_latin,
+        addr_house=parsed.house_number,
+        addr_street=parsed.street_tokens,
+        addr_locality=parsed.locality_tokens,
+        addr_city=parsed.city_token,
     )

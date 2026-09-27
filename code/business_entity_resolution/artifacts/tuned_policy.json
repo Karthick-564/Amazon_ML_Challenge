@@ -1,0 +1,35 @@
+{
+  "n_val_s1": 122,
+  "val_candidate_recall_fixed": 1.0,
+  "val_candidate_recall_adaptive": 1.0,
+  "avg_cands_adaptive": 18.270491803278688,
+  "best_flat_threshold": 0.4,
+  "best_flat_metrics": {
+    "macro_f05": 0.987389659520807,
+    "mean_precision": 1.0,
+    "mean_recall": 0.9876811594202899,
+    "avg_links": 3.5491803278688523,
+    "singletons": 6
+  },
+  "calibrated_segment_thresholds": {
+    "India": 0.45,
+    "US": 0.45
+  },
+  "fallback_threshold": 0.45,
+  "segmented_policy_metrics": {
+    "macro_f05": 0.987389659520807,
+    "mean_precision": 1.0,
+    "mean_recall": 0.9876811594202899,
+    "avg_links": 3.5491803278688523,
+    "singletons": 6
+  },
+  "evidence_aware_metrics": {
+    "macro_f05": 0.9800287192655353,
+    "mean_precision": 1.0,
+    "mean_recall": 0.9593788819875777,
+    "avg_links": 3.4262295081967213,
+    "singletons": 6
+  },
+  "runtime_s": 289.9704694747925,
+  "peak_memory_mb": 86.5800838470459
+}

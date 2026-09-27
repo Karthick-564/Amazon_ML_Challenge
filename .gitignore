@@ -1,5 +1,6 @@
 # Large competition datasets (never commit dataset)
 dataset/
+student_resource/
 output/
 *.tsv
 *.csv

@@ -1,0 +1,118 @@
+{
+  "hardware": {
+    "device": "NVIDIA GeForce RTX 3050 6GB Laptop GPU (6144 MB VRAM)",
+    "cuda_available": true,
+    "vram_mb": 6143.5
+  },
+  "dataset_split": {
+    "sample_s1_limit": 25000,
+    "n_train_s1": 20003,
+    "n_val_s1": 4997,
+    "n_train_pairs": 365938,
+    "hard_neg_count": 301958,
+    "hard_neg_pct": 100.0,
+    "bg_per_country": 3000
+  },
+  "runtime": {
+    "train_time_s": 1520.7664687633514,
+    "peak_memory_mb": 1034.3394994735718
+  },
+  "optimal_policy": {
+    "decision_threshold": 0.7,
+    "baseline_flat_threshold": 0.7999999999999998
+  },
+  "evaluation_metrics": {
+    "accuracy": 0.996083821492075,
+    "precision": 0.9972679331596671,
+    "recall": 0.9802648013989508,
+    "specificity": 0.9994316604766121,
+    "f1": 0.9886932695033227,
+    "f05": 0.9938202816330666,
+    "f2": 0.9836188852820635,
+    "balanced_accuracy": 0.9898482309377814,
+    "mcc": 0.9863786002058458,
+    "cohen_kappa": 0.9863252667765686,
+    "roc_auc": 0.999968196839061,
+    "pr_auc": 0.9998586108432101,
+    "log_loss": 0.004699975663368075,
+    "brier_score": 0.0012369286115132523,
+    "tp": 15696,
+    "tn": 75616,
+    "fp": 43,
+    "fn": 316,
+    "candidate_recall": 0.9910998092816274,
+    "all_target_candidate_recall": 0.9250144425187753,
+    "recall_at_k": {
+      "Recall@1": 0.33464363918909373,
+      "Recall@3": 0.7782414555141827,
+      "Recall@5": 0.9098124098124097,
+      "Recall@10": 0.9289389062116336
+    },
+    "precision_at_k": {
+      "Precision@1": 0.9910998092816274,
+      "Precision@3": 0.8671328671328671,
+      "Precision@5": 0.6528077982623437,
+      "Precision@10": 0.33930917567281205
+    },
+    "hit_at_k": {
+      "Hit@1": 0.9910998092816274,
+      "Hit@3": 0.9910998092816274,
+      "Hit@5": 0.9910998092816274,
+      "Hit@10": 0.9910998092816274
+    },
+    "mrr": 0.9910998092816274,
+    "map_at_k": 0.9288314379223469,
+    "avg_candidates_per_s1": 18.345207124274566,
+    "candidate_reduction_pct": 99.99981654792876,
+    "macro_f05": 0.9645806499826854,
+    "mean_precision": 0.9874541283632193,
+    "mean_recall": 0.9106733334006062,
+    "n_val_entities": 4997,
+    "exact_matches": 3807,
+    "exact_match_pct": 76.18571142685612,
+    "total_singletons": 278,
+    "correct_singletons": 275,
+    "singleton_accuracy": 0.9892086330935251,
+    "false_merges_on_singletons": 3,
+    "country_breakdown": {
+      "India": {
+        "n_entities": 1994,
+        "macro_f05": 0.947746162512109,
+        "precision": 0.9793254389960022,
+        "recall": 0.8731293119444024
+      },
+      "US": {
+        "n_entities": 3003,
+        "macro_f05": 0.9757587945102676,
+        "precision": 0.9928465123565581,
+        "recall": 0.935579166456854
+      }
+    },
+    "bucket_breakdown": {
+      "0 (singleton)": {
+        "n_entities": 278,
+        "macro_f05": 0.9892086330935251,
+        "precision": 0.0,
+        "recall": 0.0
+      },
+      "1": {
+        "n_entities": 269,
+        "macro_f05": 0.929781082197439,
+        "precision": 0.929368029739777,
+        "recall": 0.9330855018587361
+      },
+      "2": {
+        "n_entities": 849,
+        "macro_f05": 0.9599341896161684,
+        "precision": 0.980565371024735,
+        "recall": 0.9210836277974087
+      },
+      "3+": {
+        "n_entities": 3601,
+        "macro_f05": 0.966374415403566,
+        "precision": 0.9934173928758767,
+        "recall": 0.9065446987829661
+      }
+    }
+  }
+}

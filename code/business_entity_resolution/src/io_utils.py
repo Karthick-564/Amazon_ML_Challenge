@@ -10,17 +10,49 @@ from .config import DELIMITER, TSV_ENCODING
 
 
 def read_tsv(path: str | Path, expected_columns: tuple[str, ...]) -> Iterator[dict[str, str]]:
-    """Yield rows from a UTF-8 TSV and reject unexpected headers early."""
+    """Yield rows from a UTF-8 TSV and reject unexpected headers early (fast buffered line splitting)."""
     path = Path(path)
     with path.open("r", encoding=TSV_ENCODING, newline="") as handle:
-        reader = csv.DictReader(handle, delimiter=DELIMITER)
-        if tuple(reader.fieldnames or ()) != expected_columns:
+        header_line = handle.readline()
+        if not header_line:
+            return
+        actual_columns = tuple(header_line.rstrip("\r\n").split(DELIMITER))
+        if actual_columns != expected_columns:
             raise ValueError(
-                f"{path}: expected columns {expected_columns}, got {reader.fieldnames}. "
+                f"{path}: expected columns {expected_columns}, got {actual_columns}. "
                 "All challenge files must be tab-separated."
             )
-        for row in reader:
-            yield {key: (value or "").strip() for key, value in row.items()}
+        num_cols = len(expected_columns)
+        for line in handle:
+            parts = line.rstrip("\r\n").split(DELIMITER)
+            if len(parts) == num_cols:
+                yield dict(zip(expected_columns, parts))
+            else:
+                pad = parts + [""] * (num_cols - len(parts))
+                yield dict(zip(expected_columns, pad[:num_cols]))
+
+
+def read_tsv_tuples(path: str | Path, expected_columns: tuple[str, ...]) -> Iterator[list[str]]:
+    """Ultra-fast TSV line reader yielding raw column string lists without dict creation overhead."""
+    path = Path(path)
+    with path.open("r", encoding=TSV_ENCODING, newline="") as handle:
+        header_line = handle.readline()
+        if not header_line:
+            return
+        actual_columns = tuple(header_line.rstrip("\r\n").split(DELIMITER))
+        if actual_columns != expected_columns:
+            raise ValueError(
+                f"{path}: expected columns {expected_columns}, got {actual_columns}. "
+                "All challenge files must be tab-separated."
+            )
+        num_cols = len(expected_columns)
+        for line in handle:
+            parts = line.rstrip("\r\n").split(DELIMITER)
+            if len(parts) == num_cols:
+                yield parts
+            else:
+                pad = parts + [""] * (num_cols - len(parts))
+                yield pad[:num_cols]
 
 
 def parse_id_list(value: str) -> set[str]:
