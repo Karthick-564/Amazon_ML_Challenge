@@ -2,10 +2,15 @@
 dataset/
 output/
 output*/
+student_resource/
+catboost_info/
+.cache/
 *.tsv
 *.csv
 *.zip
 *.tar.gz
+*.pt
+
 
 # Python cache & build files
 __pycache__/
